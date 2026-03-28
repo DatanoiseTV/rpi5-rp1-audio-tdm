@@ -295,10 +295,6 @@ static int pio_i2s_pcm_hw_params(struct snd_soc_component *component,
 	dir = (substream->stream == SNDRV_PCM_STREAM_CAPTURE) ?
 	      PIO_I2S_DIR_CAPTURE : PIO_I2S_DIR_PLAYBACK;
 
-	ret = snd_pcm_lib_malloc_pages(substream, buf_bytes);
-	if (ret < 0)
-		return ret;
-
 	/*
 	 * Configure PIO DMA transfer size for each SM.
 	 * Each SM handles 2 channels (L+R), so it gets a fraction
@@ -360,7 +356,7 @@ static int pio_i2s_pcm_hw_free(struct snd_soc_component *component,
 	struct pio_i2s_dev *piod = snd_soc_component_get_drvdata(component);
 
 	pio_i2s_stop_all(piod);
-	return snd_pcm_lib_free_pages(substream);
+	return 0;
 }
 
 static int pio_i2s_pcm_trigger(struct snd_soc_component *component,
