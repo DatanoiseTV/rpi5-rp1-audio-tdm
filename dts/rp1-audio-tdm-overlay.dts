@@ -1,7 +1,7 @@
 /*
  * Device tree overlay for RP1 multi-peripheral I2S/TDM audio
  *
- * Enables i2s0 (GPIO18-27, up to 8ch) and optionally i2s2 (GPIO42-47,
+ * Enables i2s0 (GPIO18-27, up to 8ch) and optionally i2s2 (GPIO28-33,
  * up to 4ch full-duplex) with configurable TDM or standard I2S mode.
  *
  * MCLK output can optionally be provided via GPCLK0 on GPIO4, derived
