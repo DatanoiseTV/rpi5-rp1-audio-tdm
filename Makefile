@@ -16,6 +16,8 @@ OVERLAY_DIR ?= /boot/overlays
 # Device tree compiler
 DTC ?= dtc
 DTC_FLAGS ?= -@ -I dts -O dtb -W no-unit_address_vs_reg
+CPP ?= cpp
+KERNEL_INCLUDE ?= $(KERNEL_DIR)
 
 .PHONY: all module dtbo install install-module install-dtbo clean help
 
@@ -26,8 +28,9 @@ module:
 
 dtbo: dts/rp1-audio-tdm.dtbo
 
-dts/%.dtbo: dts/%.dts
-	$(DTC) $(DTC_FLAGS) -o $@ $<
+dts/%.dtbo: dts/%-overlay.dts
+	$(CPP) -nostdinc -I $(KERNEL_INCLUDE)/include -undef -x assembler-with-cpp $< | \
+		$(DTC) $(DTC_FLAGS) -o $@ -
 
 install: install-module install-dtbo
 
