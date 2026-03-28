@@ -192,13 +192,15 @@ static int rp1_tdm_hw_params(struct snd_pcm_substream *substream,
 	return 0;
 }
 
-static void rp1_tdm_hw_free(struct snd_pcm_substream *substream)
+static int rp1_tdm_hw_free(struct snd_pcm_substream *substream)
 {
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 	struct rp1_audio_tdm_priv *priv = snd_soc_card_get_drvdata(rtd->card);
 
 	if (priv->mclk_clk && priv->mclk_fs)
 		clk_disable_unprepare(priv->mclk_clk);
+
+	return 0;
 }
 
 static const struct snd_soc_ops rp1_tdm_ops = {
