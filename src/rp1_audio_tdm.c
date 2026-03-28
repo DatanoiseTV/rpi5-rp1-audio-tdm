@@ -389,8 +389,8 @@ static void rp1_tdm_release_of_nodes(void *data)
 	int i;
 
 	for (i = 0; i < RP1_TDM_MAX_LINKS; i++) {
-		of_node_put(priv->i2s_nodes[i]);
-		priv->i2s_nodes[i] = NULL;
+		of_node_put(priv->link_nodes[i]);
+		priv->link_nodes[i] = NULL;
 	}
 }
 
@@ -408,7 +408,7 @@ static int rp1_tdm_setup_links(struct rp1_audio_tdm_priv *priv)
 		if (!i2s_np)
 			continue;
 
-		priv->i2s_nodes[i] = i2s_np;
+		priv->link_nodes[i] = i2s_np;
 
 		link = &priv->dai_links[n];
 		link->name          = rp1_link_defs[i].name;
