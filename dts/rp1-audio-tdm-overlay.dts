@@ -130,20 +130,37 @@
 	};
 
 	/* ----------------------------------------------------------
-	 * Fragment 6: Sound card node for the machine driver
+	 * Fragment 6: PIO I2S expansion on GPIO24-27
+	 * Adds 8 more channels via PIO state machines, synchronized
+	 * to hardware I2S BCLK on GPIO18.
 	 * ---------------------------------------------------------- */
 	fragment@6 {
+		target-path = "/";
+		__overlay__ {
+			rp1_pio_i2s: rp1-pio-i2s {
+				compatible = "datanoisetv,rp1-pio-i2s";
+				status = "okay";
+				data-gpio-base = <24>;
+				data-gpio-count = <4>;
+			};
+		};
+	};
+
+	/* ----------------------------------------------------------
+	 * Fragment 7: Sound card node for the machine driver
+	 * ---------------------------------------------------------- */
+	fragment@7 {
 		target-path = "/";
 		__overlay__ {
 			rp1_audio_tdm: rp1-audio-tdm {
 				compatible = "datanoisetv,rp1-audio-tdm";
 				status = "okay";
 
-				/* Primary I2S controller (8ch capable) */
+				/* Primary I2S controller (8ch via DWC hardware) */
 				i2s-controller-0 = <&rp1_i2s0>;
 
-				/* Secondary I2S controller (4ch full-duplex) */
-				i2s-controller-1 = <&rp1_i2s2>;
+				/* PIO I2S expansion (8ch via PIO state machines) */
+				pio-i2s = <&rp1_pio_i2s>;
 
 				/*
 				 * MCLK output via GPCLK0 on GPIO4.
