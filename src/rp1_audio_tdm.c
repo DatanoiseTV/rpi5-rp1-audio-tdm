@@ -81,6 +81,18 @@ static int rp1_tdm_dai_init(struct snd_soc_pcm_runtime *rtd)
 		fmt |= SND_SOC_DAIFMT_BC_FC;
 
 	ret = snd_soc_dai_set_fmt(cpu_dai, fmt);
+	if (ret == -EINVAL && priv->is_master) {
+		/*
+		 * This DAI may be hardware-configured as slave only
+		 * (COMP1 MODE_EN=0). Fall back to slave mode.
+		 */
+		dev_warn(priv->dev,
+			 "%s: master mode not supported, falling back to slave\n",
+			 rtd->dai_link->name);
+		fmt &= ~SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK;
+		fmt |= SND_SOC_DAIFMT_BC_FC;
+		ret = snd_soc_dai_set_fmt(cpu_dai, fmt);
+	}
 	if (ret && ret != -ENOTSUPP) {
 		dev_err(priv->dev, "failed to set CPU DAI format: %d\n", ret);
 		return ret;
@@ -269,17 +281,22 @@ static int rp1_tdm_parse_dt(struct rp1_audio_tdm_priv *priv)
 	priv->mclk_fs = ret ? 0 : val;
 
 	if (priv->mclk_fs) {
-		priv->mclk_clk = devm_clk_get(priv->dev, "mclk");
-		if (IS_ERR(priv->mclk_clk)) {
-			/* Try getting it by phandle */
-			priv->mclk_clk = of_clk_get_by_name(np, "mclk");
-			if (IS_ERR(priv->mclk_clk)) {
-				dev_warn(priv->dev,
-					 "MCLK requested (mclk-fs=%u) but clock not available, disabling\n",
-					 priv->mclk_fs);
-				priv->mclk_clk = NULL;
-				priv->mclk_fs = 0;
-			}
+		struct of_phandle_args clkspec;
+
+		/* The DT provides the clock as a phandle: mclk-clk = <&...> */
+		ret = of_parse_phandle_with_args(np, "mclk-clk",
+						 "#clock-cells", 0, &clkspec);
+		if (!ret) {
+			priv->mclk_clk = of_clk_get_from_provider(&clkspec);
+			of_node_put(clkspec.np);
+		}
+
+		if (IS_ERR_OR_NULL(priv->mclk_clk)) {
+			dev_warn(priv->dev,
+				 "MCLK requested (mclk-fs=%u) but clock not available, disabling\n",
+				 priv->mclk_fs);
+			priv->mclk_clk = NULL;
+			priv->mclk_fs = 0;
 		}
 	}
 
