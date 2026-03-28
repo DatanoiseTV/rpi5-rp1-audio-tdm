@@ -282,70 +282,18 @@ static int pio_i2s_pcm_hw_params(struct snd_soc_component *component,
 {
 	struct pio_i2s_dev *piod = snd_soc_component_get_drvdata(component);
 	unsigned int channels = params_channels(params);
-	unsigned int period_bytes = params_period_bytes(params);
-	unsigned int num_periods = params_periods(params);
-	unsigned int buf_bytes = params_buffer_bytes(params);
 	unsigned int num_sms = channels / PIO_I2S_CHANNELS_PER_SM;
-	enum pio_i2s_dir dir;
-	int ret, i;
 
-	if (channels % PIO_I2S_CHANNELS_PER_SM != 0 || num_sms > piod->num_data_pins)
+	if (channels % PIO_I2S_CHANNELS_PER_SM != 0 ||
+	    num_sms > piod->num_data_pins)
 		return -EINVAL;
-
-	dir = (substream->stream == SNDRV_PCM_STREAM_CAPTURE) ?
-	      PIO_I2S_DIR_CAPTURE : PIO_I2S_DIR_PLAYBACK;
-
-	/*
-	 * Configure PIO DMA transfer size for each SM.
-	 * Each SM handles 2 channels (L+R), so it gets a fraction
-	 * of the total period.
-	 *
-	 * For interleaved audio with N SMs:
-	 *   Total period = period_bytes
-	 *   Per-SM period = period_bytes / num_sms
-	 *   (each SM reads/writes its 2-channel portion)
-	 *
-	 * Note: for this initial version, each SM gets its own
-	 * contiguous buffer region. Interleaving to/from the ALSA
-	 * buffer happens in software.
-	 */
-	for (i = 0; i < num_sms; i++) {
-		struct pio_i2s_sm_state *sm = &piod->sms[i];
-
-		ret = pio_i2s_configure_sm(piod, sm, dir);
-		if (ret)
-			return ret;
-
-		/* Each SM transfers 2ch worth of the period */
-		sm->period_bytes = (period_bytes / num_sms);
-		sm->num_periods = num_periods;
-		sm->buf_bytes = sm->period_bytes * num_periods;
-		sm->hw_ptr = 0;
-
-		/*
-		 * Point each SM at its portion of the ALSA DMA buffer.
-		 * SM0 gets the first chunk, SM1 the next, etc.
-		 * This layout matches ALSA non-interleaved access.
-		 */
-		sm->buf = substream->runtime->dma_area +
-			  (i * sm->buf_bytes);
-
-		/* Configure PIO DMA bounce buffers */
-		ret = pio_sm_config_xfer(piod->pio, sm->sm_index,
-					 dir == PIO_I2S_DIR_CAPTURE ?
-					 PIO_DIR_FROM_SM : PIO_DIR_TO_SM,
-					 sm->period_bytes, 2);
-		if (ret)
-			return ret;
-	}
 
 	piod->num_sms = num_sms;
 
-	dev_dbg(piod->dev,
-		"pio_i2s: %s %uch rate=%u period=%u periods=%u sms=%u\n",
-		dir == PIO_I2S_DIR_CAPTURE ? "capture" : "playback",
-		channels, params_rate(params), period_bytes, num_periods,
-		num_sms);
+	dev_info(piod->dev,
+		 "pio_i2s hw_params: %uch rate=%u period=%u sms=%u\n",
+		 channels, params_rate(params),
+		 params_period_size(params), num_sms);
 
 	return 0;
 }
