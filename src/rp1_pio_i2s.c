@@ -7,10 +7,6 @@
  * machine handles one data pin, shifting 32-bit samples in or out
  * on BCLK edges with DMA to/from memory.
  *
- * The PIO programs are 3 instructions each and run from clk_sys
- * (200 MHz), giving ~65 PIO cycles per BCLK edge at 48kHz -- well
- * within timing margins.
- *
  * Copyright (c) 2026 DatanoiseTV
  */
 
@@ -52,182 +48,130 @@ static const struct pio_program playback_program = {
 	.origin = -1,
 };
 
-/* --- PIO state machine setup ------------------------------------- */
+/* --- PIO state machine configuration ----------------------------- */
 
-/*
- * Configure one PIO SM for I2S operation on a single data pin.
- * The SM runs the capture or playback program, with autopush/autopull
- * at 32 bits (one sample = 32 BCLK cycles).
- */
-static int pio_i2s_configure_sm(struct pio_i2s_dev *piod,
-				struct pio_i2s_sm_state *sm,
+static int pio_i2s_load_program(struct pio_i2s_dev *piod,
 				enum pio_i2s_dir dir)
 {
 	PIO pio = piod->pio;
-	pio_sm_config c;
-	uint offset;
+	const struct pio_program *prog;
+	unsigned int *offset;
+	bool *loaded;
 
 	if (dir == PIO_I2S_DIR_CAPTURE) {
-		if (!piod->capture_loaded) {
-			piod->capture_offset = pio_add_program(pio,
-							       &capture_program);
-			if (piod->capture_offset == PIO_ORIGIN_ANY)
-				return -ENOMEM;
-			piod->capture_loaded = true;
-		}
-		offset = piod->capture_offset;
+		prog = &capture_program;
+		offset = &piod->capture_offset;
+		loaded = &piod->capture_loaded;
 	} else {
-		if (!piod->playback_loaded) {
-			piod->playback_offset = pio_add_program(pio,
-								&playback_program);
-			if (piod->playback_offset == PIO_ORIGIN_ANY)
-				return -ENOMEM;
-			piod->playback_loaded = true;
-		}
-		offset = piod->playback_offset;
+		prog = &playback_program;
+		offset = &piod->playback_offset;
+		loaded = &piod->playback_loaded;
 	}
 
-	sm->dir = dir;
+	if (*loaded)
+		return 0;
 
-	/* Set data pin to PIO function */
+	*offset = pio_add_program(pio, prog);
+	if (*offset == PIO_ORIGIN_ANY)
+		return -ENOMEM;
+
+	*loaded = true;
+	return 0;
+}
+
+static int pio_i2s_configure_sm(struct pio_i2s_dev *piod,
+				struct pio_i2s_sm_state *sm)
+{
+	PIO pio = piod->pio;
+	pio_sm_config c;
+	unsigned int offset;
+	bool is_output;
+
+	is_output = (sm->dir == PIO_I2S_DIR_PLAYBACK);
+	offset = is_output ? piod->playback_offset : piod->capture_offset;
+
 	pio_gpio_init(pio, sm->gpio);
-
-	if (dir == PIO_I2S_DIR_PLAYBACK)
-		pio_sm_set_consecutive_pindirs(pio, sm->sm_index,
-					       sm->gpio, 1, true);
-	else
-		pio_sm_set_consecutive_pindirs(pio, sm->sm_index,
-					       sm->gpio, 1, false);
+	pio_sm_set_consecutive_pindirs(pio, sm->sm_index,
+				       sm->gpio, 1, is_output);
 
 	c = pio_get_default_sm_config();
 	sm_config_set_wrap(&c, offset, offset + PIO_I2S_PROG_LEN - 1);
 
-	if (dir == PIO_I2S_DIR_CAPTURE) {
-		sm_config_set_in_pins(&c, sm->gpio);
-		/* MSB first, autopush at 32 bits */
-		sm_config_set_in_shift(&c, false, true, 32);
-		sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
-	} else {
+	if (is_output) {
 		sm_config_set_out_pins(&c, sm->gpio, 1);
-		/* MSB first, autopull at 32 bits */
 		sm_config_set_out_shift(&c, false, true, 32);
 		sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+	} else {
+		sm_config_set_in_pins(&c, sm->gpio);
+		sm_config_set_in_shift(&c, false, true, 32);
+		sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
 	}
 
-	/*
-	 * Clock divider = 1 (run at full clk_sys speed).
-	 * The WAIT instructions handle synchronization to BCLK.
-	 */
 	sm_config_set_clkdiv(&c, make_fp24_8(1, 1));
-
 	pio_sm_init(pio, sm->sm_index, offset, &c);
 
 	return 0;
 }
 
-/*
- * Synchronize all PIO SMs to the I2S frame boundary.
- * Execute WAIT instructions to align to the LRCLK falling edge
- * (start of left channel), then enable all SMs simultaneously.
- */
-static void pio_i2s_sync_and_start(struct pio_i2s_dev *piod)
-{
-	PIO pio = piod->pio;
-	uint16_t sm_mask = 0;
-	int i;
-
-	/* Sync each SM to LRCLK frame boundary */
-	for (i = 0; i < piod->num_sms; i++) {
-		struct pio_i2s_sm_state *sm = &piod->sms[i];
-
-		/* Execute sync instructions: wait for LRCLK high then low */
-		pio_sm_exec(pio, sm->sm_index, PIO_WAIT_LRCLK_HI);
-		pio_sm_exec(pio, sm->sm_index, PIO_WAIT_LRCLK_LO);
-		sm_mask |= BIT(sm->sm_index);
-	}
-
-	/* Start all SMs simultaneously for sample alignment */
-	pio_sm_set_enabled(pio, sm_mask, true);
-}
-
-static void pio_i2s_stop_all(struct pio_i2s_dev *piod)
-{
-	PIO pio = piod->pio;
-	uint16_t sm_mask = 0;
-	int i;
-
-	for (i = 0; i < piod->num_sms; i++) {
-		piod->sms[i].running = false;
-		sm_mask |= BIT(piod->sms[i].sm_index);
-	}
-
-	pio_sm_set_enabled(pio, sm_mask, false);
-}
-
 /* --- DMA ring buffer management ---------------------------------- */
 
+static void pio_i2s_dma_callback(void *param);
+
 /*
- * DMA completion callback. Called when one period of audio data has
- * been transferred between the PIO FIFO and memory.
- *
- * For capture: PIO FIFO -> bounce buffer -> ALSA ring buffer
- * For playback: ALSA ring buffer -> bounce buffer -> PIO FIFO
+ * Work handler for DMA chaining. Runs in process context so it
+ * can call the PIO xfer_data API (which may sleep).
  */
-static void pio_i2s_dma_complete(void *param)
+static void pio_i2s_dma_work(struct work_struct *work)
 {
-	struct pio_i2s_sm_state *sm = param;
-	struct pio_i2s_dev *piod;
+	struct pio_i2s_sm_state *sm =
+		container_of(work, struct pio_i2s_sm_state, dma_work);
+	struct pio_i2s_dev *piod = sm->piod;
 	struct snd_pcm_substream *substream;
+	unsigned char *buf;
+	int pio_dir;
 
 	if (!sm->running)
 		return;
 
-	/* Advance the hardware pointer */
-	sm->hw_ptr += sm->period_bytes;
-	if (sm->hw_ptr >= sm->buf_bytes)
-		sm->hw_ptr = 0;
+	substream = (sm->dir == PIO_I2S_DIR_CAPTURE) ?
+		    piod->capture_substream : piod->playback_substream;
+	pio_dir = (sm->dir == PIO_I2S_DIR_CAPTURE) ?
+		  PIO_DIR_FROM_SM : PIO_DIR_TO_SM;
 
-	/* Determine which substream this SM belongs to */
-	piod = container_of(sm, struct pio_i2s_dev,
-			    sms[sm->sm_index - piod->sms[0].sm_index]);
+	/* If this isn't the first transfer, a period just completed */
+	if (sm->dma_started) {
+		sm->hw_ptr += sm->period_bytes;
+		if (sm->hw_ptr >= sm->buf_bytes)
+			sm->hw_ptr = 0;
 
-	if (sm->dir == PIO_I2S_DIR_CAPTURE)
-		substream = piod->capture_substream;
-	else
-		substream = piod->playback_substream;
-
-	/* Notify ALSA that a period has elapsed */
-	if (substream)
-		snd_pcm_period_elapsed(substream);
-
-	/* Chain the next DMA transfer */
-	if (sm->running) {
-		void *buf_pos = sm->buf + sm->hw_ptr;
-
-		pio_sm_xfer_data(piod->pio, sm->sm_index,
-				 sm->dir == PIO_I2S_DIR_CAPTURE ?
-				 PIO_DIR_FROM_SM : PIO_DIR_TO_SM,
-				 sm->period_bytes, buf_pos, 0,
-				 pio_i2s_dma_complete, sm);
+		if (substream)
+			snd_pcm_period_elapsed(substream);
 	}
+
+	if (!sm->running)
+		return;
+
+	sm->dma_started = true;
+	buf = sm->dma_area + sm->hw_ptr;
+
+	pio_sm_xfer_data(piod->pio, sm->sm_index, pio_dir,
+			 sm->period_bytes, buf, 0,
+			 pio_i2s_dma_callback, sm);
 }
 
-static int pio_i2s_start_dma(struct pio_i2s_dev *piod,
-			      struct pio_i2s_sm_state *sm)
+/*
+ * DMA completion callback. Runs in tasklet/softirq context.
+ * Cannot call sleeping functions, so we schedule work.
+ */
+static void pio_i2s_dma_callback(void *param)
 {
-	void *buf_pos = sm->buf + sm->hw_ptr;
-	int dir;
+	struct pio_i2s_sm_state *sm = param;
 
-	sm->running = true;
-	dir = (sm->dir == PIO_I2S_DIR_CAPTURE) ?
-	      PIO_DIR_FROM_SM : PIO_DIR_TO_SM;
-
-	return pio_sm_xfer_data(piod->pio, sm->sm_index, dir,
-				sm->period_bytes, buf_pos, 0,
-				pio_i2s_dma_complete, sm);
+	if (sm->running)
+		queue_work(sm->piod->wq, &sm->dma_work);
 }
 
-/* --- ASoC component and DAI -------------------------------------- */
+/* --- ASoC component callbacks ------------------------------------ */
 
 static const struct snd_pcm_hardware pio_i2s_pcm_hardware = {
 	.info = SNDRV_PCM_INFO_INTERLEAVED |
@@ -240,7 +184,7 @@ static const struct snd_pcm_hardware pio_i2s_pcm_hardware = {
 	.channels_min = 2,
 	.channels_max = PIO_I2S_MAX_CHANNELS,
 	.period_bytes_min = 64,
-	.period_bytes_max = 4096,
+	.period_bytes_max = 4096,  /* PIO DMA bounce buffer limit */
 	.periods_min = 2,
 	.periods_max = 32,
 	.buffer_bytes_max = 4096 * 32,
@@ -250,7 +194,6 @@ static int pio_i2s_pcm_open(struct snd_soc_component *component,
 			     struct snd_pcm_substream *substream)
 {
 	struct pio_i2s_dev *piod = snd_soc_component_get_drvdata(component);
-	struct snd_pcm_runtime *runtime = substream->runtime;
 
 	snd_soc_set_runtime_hwparams(substream, &pio_i2s_pcm_hardware);
 
@@ -259,8 +202,7 @@ static int pio_i2s_pcm_open(struct snd_soc_component *component,
 	else
 		piod->playback_substream = substream;
 
-	return snd_pcm_hw_constraint_step(runtime, 0,
-					  SNDRV_PCM_HW_PARAM_PERIOD_SIZE, 2);
+	return 0;
 }
 
 static int pio_i2s_pcm_close(struct snd_soc_component *component,
@@ -282,18 +224,57 @@ static int pio_i2s_pcm_hw_params(struct snd_soc_component *component,
 {
 	struct pio_i2s_dev *piod = snd_soc_component_get_drvdata(component);
 	unsigned int channels = params_channels(params);
+	unsigned int period_bytes = params_period_bytes(params);
+	unsigned int num_periods = params_periods(params);
 	unsigned int num_sms = channels / PIO_I2S_CHANNELS_PER_SM;
+	enum pio_i2s_dir dir;
+	int ret, i;
 
 	if (channels % PIO_I2S_CHANNELS_PER_SM != 0 ||
 	    num_sms > piod->num_data_pins)
 		return -EINVAL;
 
+	dir = (substream->stream == SNDRV_PCM_STREAM_CAPTURE) ?
+	      PIO_I2S_DIR_CAPTURE : PIO_I2S_DIR_PLAYBACK;
+
+	ret = pio_i2s_load_program(piod, dir);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < num_sms; i++) {
+		struct pio_i2s_sm_state *sm = &piod->sms[i];
+
+		sm->dir = dir;
+		sm->period_bytes = period_bytes / num_sms;
+		sm->buf_bytes = sm->period_bytes * num_periods;
+		sm->hw_ptr = 0;
+		sm->dma_started = false;
+		sm->running = false;
+
+		ret = pio_i2s_configure_sm(piod, sm);
+		if (ret)
+			return ret;
+
+		/* Configure PIO DMA bounce buffers: 2 for double-buffering */
+		ret = pio_sm_config_xfer(piod->pio, sm->sm_index,
+					 dir == PIO_I2S_DIR_CAPTURE ?
+					 PIO_DIR_FROM_SM : PIO_DIR_TO_SM,
+					 sm->period_bytes, 2);
+		if (ret) {
+			dev_err(piod->dev,
+				"PIO DMA config failed for SM%u: %d\n",
+				sm->sm_index, ret);
+			return ret;
+		}
+	}
+
 	piod->num_sms = num_sms;
 
 	dev_info(piod->dev,
-		 "pio_i2s hw_params: %uch rate=%u period=%u sms=%u\n",
+		 "pio_i2s: %s %uch rate=%u period=%u(%u bytes) sms=%u\n",
+		 dir == PIO_I2S_DIR_CAPTURE ? "capture" : "playback",
 		 channels, params_rate(params),
-		 params_period_size(params), num_sms);
+		 params_period_size(params), period_bytes, num_sms);
 
 	return 0;
 }
@@ -302,8 +283,45 @@ static int pio_i2s_pcm_hw_free(struct snd_soc_component *component,
 				struct snd_pcm_substream *substream)
 {
 	struct pio_i2s_dev *piod = snd_soc_component_get_drvdata(component);
+	uint16_t sm_mask = 0;
+	int i;
 
-	pio_i2s_stop_all(piod);
+	for (i = 0; i < piod->num_sms; i++) {
+		piod->sms[i].running = false;
+		sm_mask |= BIT(piod->sms[i].sm_index);
+	}
+
+	pio_sm_set_enabled(piod->pio, sm_mask, false);
+
+	/* Wait for pending DMA work to complete */
+	flush_workqueue(piod->wq);
+
+	return 0;
+}
+
+static int pio_i2s_pcm_prepare(struct snd_soc_component *component,
+				struct snd_pcm_substream *substream)
+{
+	struct pio_i2s_dev *piod = snd_soc_component_get_drvdata(component);
+	int i;
+
+	/* Store the ALSA DMA buffer address for each SM */
+	for (i = 0; i < piod->num_sms; i++) {
+		struct pio_i2s_sm_state *sm = &piod->sms[i];
+
+		/*
+		 * For 2ch (1 SM): the full ALSA buffer is ours.
+		 * For >2ch: each SM gets a contiguous slice.
+		 * TODO: proper interleaving for multi-SM.
+		 */
+		sm->dma_area = (unsigned char *)substream->runtime->dma_area +
+			       (i * sm->buf_bytes);
+		sm->hw_ptr = 0;
+		sm->dma_started = false;
+
+		pio_sm_clear_fifos(piod->pio, sm->sm_index);
+	}
+
 	return 0;
 }
 
@@ -311,24 +329,24 @@ static int pio_i2s_pcm_trigger(struct snd_soc_component *component,
 				struct snd_pcm_substream *substream, int cmd)
 {
 	struct pio_i2s_dev *piod = snd_soc_component_get_drvdata(component);
-	int i, ret;
+	int i;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
-		/* Start DMA on all active SMs */
 		for (i = 0; i < piod->num_sms; i++) {
-			ret = pio_i2s_start_dma(piod, &piod->sms[i]);
-			if (ret)
-				return ret;
+			piod->sms[i].running = true;
+			piod->sms[i].dma_started = false;
+			/* Schedule work to start DMA + enable SMs */
+			queue_work(piod->wq, &piod->sms[i].dma_work);
 		}
-		/* Sync to LRCLK and start all SMs */
-		pio_i2s_sync_and_start(piod);
 		break;
 
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
-		pio_i2s_stop_all(piod);
+		for (i = 0; i < piod->num_sms; i++)
+			piod->sms[i].running = false;
+		/* SMs will be disabled in hw_free or next prepare */
 		break;
 
 	default:
@@ -344,17 +362,9 @@ static snd_pcm_uframes_t pio_i2s_pcm_pointer(
 {
 	struct pio_i2s_dev *piod = snd_soc_component_get_drvdata(component);
 
-	/*
-	 * Return the position of SM0 as the canonical pointer.
-	 * All SMs advance in lockstep since they're clocked by
-	 * the same BCLK.
-	 */
-	if (piod->num_sms > 0) {
-		unsigned int bytes = piod->sms[0].hw_ptr;
-
-		return bytes_to_frames(substream->runtime, bytes);
-	}
-
+	if (piod->num_sms > 0)
+		return bytes_to_frames(substream->runtime,
+				       piod->sms[0].hw_ptr);
 	return 0;
 }
 
@@ -369,17 +379,19 @@ static int pio_i2s_pcm_new(struct snd_soc_component *component,
 }
 
 static const struct snd_soc_component_driver pio_i2s_component_driver = {
-	.name       = "rp1-pio-i2s",
-	.open       = pio_i2s_pcm_open,
-	.close      = pio_i2s_pcm_close,
-	.hw_params  = pio_i2s_pcm_hw_params,
-	.hw_free    = pio_i2s_pcm_hw_free,
-	.trigger    = pio_i2s_pcm_trigger,
-	.pointer    = pio_i2s_pcm_pointer,
+	.name          = "rp1-pio-i2s",
+	.open          = pio_i2s_pcm_open,
+	.close         = pio_i2s_pcm_close,
+	.hw_params     = pio_i2s_pcm_hw_params,
+	.hw_free       = pio_i2s_pcm_hw_free,
+	.prepare       = pio_i2s_pcm_prepare,
+	.trigger       = pio_i2s_pcm_trigger,
+	.pointer       = pio_i2s_pcm_pointer,
 	.pcm_construct = pio_i2s_pcm_new,
 };
 
-/* DAI: minimal, just declares capabilities */
+/* --- DAI driver -------------------------------------------------- */
+
 static struct snd_soc_dai_driver pio_i2s_dai_driver = {
 	.name = "rp1-pio-i2s-dai",
 	.capture = {
@@ -415,7 +427,6 @@ static int rp1_pio_i2s_probe(struct platform_device *pdev)
 	piod->dev = dev;
 	platform_set_drvdata(pdev, piod);
 
-	/* Read data pin configuration from DT */
 	if (of_property_read_u32(dev->of_node, "data-gpio-base", &base_gpio))
 		base_gpio = PIO_I2S_DATA_BASE_GPIO;
 	if (of_property_read_u32(dev->of_node, "data-gpio-count", &num_pins))
@@ -425,18 +436,23 @@ static int rp1_pio_i2s_probe(struct platform_device *pdev)
 		num_pins = PIO_I2S_MAX_SMS;
 	if (base_gpio + num_pins > RP1_PIO_GPIO_COUNT)
 		return dev_err_probe(dev, -EINVAL,
-				     "GPIO%u-%u out of PIO range (0-%u)\n",
-				     base_gpio, base_gpio + num_pins - 1,
-				     RP1_PIO_GPIO_COUNT - 1);
+				     "GPIO%u-%u exceeds PIO range\n",
+				     base_gpio, base_gpio + num_pins - 1);
 
 	piod->data_base_gpio = base_gpio;
 	piod->num_data_pins = num_pins;
 
-	/* Open PIO and claim state machines */
+	/* High-priority workqueue for low-latency DMA chaining */
+	piod->wq = alloc_workqueue("pio-i2s", WQ_HIGHPRI | WQ_UNBOUND, 0);
+	if (!piod->wq)
+		return -ENOMEM;
+
 	piod->pio = pio_open();
-	if (IS_ERR(piod->pio))
-		return dev_err_probe(dev, PTR_ERR(piod->pio),
-				     "failed to open PIO\n");
+	if (IS_ERR(piod->pio)) {
+		ret = dev_err_probe(dev, PTR_ERR(piod->pio),
+				    "failed to open PIO\n");
+		goto err_wq;
+	}
 
 	for (i = 0; i < num_pins; i++) {
 		int sm = pio_claim_unused_sm(piod->pio, false);
@@ -449,11 +465,14 @@ static int rp1_pio_i2s_probe(struct platform_device *pdev)
 
 		piod->sms[i].sm_index = sm;
 		piod->sms[i].gpio = base_gpio + i;
+		piod->sms[i].piod = piod;
+		INIT_WORK(&piod->sms[i].dma_work, pio_i2s_dma_work);
 	}
 
-	/* Register ASoC component + DAI */
-	pio_i2s_dai_driver.capture.channels_max = num_pins * PIO_I2S_CHANNELS_PER_SM;
-	pio_i2s_dai_driver.playback.channels_max = num_pins * PIO_I2S_CHANNELS_PER_SM;
+	pio_i2s_dai_driver.capture.channels_max =
+		num_pins * PIO_I2S_CHANNELS_PER_SM;
+	pio_i2s_dai_driver.playback.channels_max =
+		num_pins * PIO_I2S_CHANNELS_PER_SM;
 
 	ret = devm_snd_soc_register_component(dev, &pio_i2s_component_driver,
 					      &pio_i2s_dai_driver, 1);
@@ -468,14 +487,25 @@ static int rp1_pio_i2s_probe(struct platform_device *pdev)
 
 err_pio:
 	pio_close(piod->pio);
+err_wq:
+	destroy_workqueue(piod->wq);
 	return ret;
 }
 
 static void rp1_pio_i2s_remove(struct platform_device *pdev)
 {
 	struct pio_i2s_dev *piod = platform_get_drvdata(pdev);
+	uint16_t sm_mask = 0;
+	int i;
 
-	pio_i2s_stop_all(piod);
+	for (i = 0; i < piod->num_data_pins; i++) {
+		piod->sms[i].running = false;
+		sm_mask |= BIT(piod->sms[i].sm_index);
+	}
+
+	pio_sm_set_enabled(piod->pio, sm_mask, false);
+	flush_workqueue(piod->wq);
+	destroy_workqueue(piod->wq);
 
 	if (piod->capture_loaded)
 		pio_remove_program(piod->pio, &capture_program,
