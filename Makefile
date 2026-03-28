@@ -17,7 +17,10 @@ OVERLAY_DIR ?= /boot/overlays
 DTC ?= dtc
 DTC_FLAGS ?= -@ -I dts -O dtb -W no-unit_address_vs_reg
 CPP ?= cpp
-KERNEL_INCLUDE ?= $(KERNEL_DIR)
+
+# dt-bindings headers live in the -common-rpi package on RPi OS
+KERNEL_COMMON_DIR ?= $(wildcard /usr/src/linux-headers-$(shell uname -r 2>/dev/null | sed 's/-rpi-2712/-common-rpi/')/)
+KERNEL_INCLUDE ?= $(if $(KERNEL_COMMON_DIR),$(KERNEL_COMMON_DIR),$(KERNEL_DIR))
 
 .PHONY: all module dtbo install install-module install-dtbo clean help
 
