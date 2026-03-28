@@ -1,0 +1,64 @@
+From: DatanoiseTV <noreply@datanoise.tv>
+Subject: [PATCH] ASoC: dwc: fix TDM master mode clock configuration
+
+The DesignWare I2S CCR (Clock Configuration Register) only accepted
+frame lengths of 32, 48, or 64, which made TDM master mode with more
+than 2 slots impossible. When using 8 TDM slots at 32-bit width the
+required bclk_ratio is 256, which was rejected with -EINVAL.
+
+In TDM mode the CCR should reflect the per-slot word length (always
+32-bit for this IP), not the total frame length. The actual BCLK rate
+must account for the total number of slots.
+
+This patch:
+ - Detects active TDM mode and sets CCR based on slot width
+ - Computes BCLK as sample_rate * slots * slot_width for TDM
+ - Falls back to the original logic for standard I2S mode
+
+Tested on Raspberry Pi 5 (RP1 DesignWare I2S) with 8-slot TDM in
+master mode at 48kHz and 96kHz.
+
+Signed-off-by: DatanoiseTV <noreply@datanoise.tv>
+---
+ sound/soc/dwc/dwc-i2s.c | 30 ++++++++++++++++++++++++------
+ 1 file changed, 24 insertions(+), 6 deletions(-)
+
+diff --git a/sound/soc/dwc/dwc-i2s.c b/sound/soc/dwc/dwc-i2s.c
+index XXXXXXX..XXXXXXX 100644
+--- a/sound/soc/dwc/dwc-i2s.c
++++ b/sound/soc/dwc/dwc-i2s.c
+@@ -399,8 +399,28 @@ static int dw_i2s_hw_params(struct snd_pcm_substream *substream,
+ 	if (dev->capability & DW_I2S_MASTER) {
+ 		u32 frame_length = config->data_width * 2;
+
+-		if (dev->bclk_ratio)
+-			frame_length = dev->bclk_ratio;
++		if (dev->tdm_slots) {
++			/*
++			 * In TDM mode, CCR configures the per-slot word
++			 * length, not the total frame. The hardware uses
++			 * IER[TDM_SLOTS] to determine the frame structure.
++			 * Force CCR to match the 32-bit slot width.
++			 */
++			frame_length = dev->tdm_slots * config->data_width;
++
++			dev->ccr = 0x10; /* 64-bit word pair (32-bit per slot) */
++
++			u32 bitclk = config->sample_rate * frame_length;
++			int ret2 = clk_set_rate(dev->clk, bitclk);
++			if (ret2) {
++				dev_err(dev->dev,
++					"Can't set TDM I2S clock rate %u: %d\n",
++					bitclk, ret2);
++				return ret2;
++			}
++			i2s_write_reg(dev->i2s_base, CCR, dev->ccr);
++			return 0;
++		}
++
++		if (dev->bclk_ratio) frame_length = dev->bclk_ratio;
+
+ 		switch (frame_length) {
+ 		case 32:
+--
+2.39.0

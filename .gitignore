@@ -1,0 +1,35 @@
+# Build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.cmd
+*.order
+*.symvers
+.tmp_versions/
+modules.order
+Module.symvers
+
+# Kernel build
+.cache.mk
+.*.cmd
+
+# Device tree compiled
+*.dtbo
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Project internal
+TODO.md
+STRUCTURE.md
+CLAUDE.md
+
+# OS
+.DS_Store
+Thumbs.db
