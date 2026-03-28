@@ -2,9 +2,13 @@
 /*
  * rp1_audio_tdm.c - RP1 multi-peripheral I2S/TDM machine driver
  *
- * Combines RP1 i2s0 (8ch, master-capable) and i2s2 (8ch, slave-only)
- * into a single ALSA sound card. Supports standard I2S and TDM
- * (DSP-A/B) modes with optional MCLK output via GPCLK.
+ * Combines RP1 i2s0 (8ch, master-capable, GPIO18-27 on 40-pin header)
+ * and optionally i2s2 (slave-only, GPIO28-33, not on header) into a
+ * single ALSA sound card. Supports standard I2S and TDM (DSP-A/B)
+ * modes with optional MCLK output via GPCLK0 on GPIO4.
+ *
+ * Designed for low-latency operation: period sizes down to 32 frames
+ * (0.67ms at 48kHz) are supported with the RP1 DMA engine.
  *
  * Hardware: Raspberry Pi 5 RP1 southbridge, Synopsys DesignWare I2S
  *
@@ -28,7 +32,7 @@
 #define GIT_HASH "unknown"
 #endif
 
-/* --- DAI format parsing ------------------------------------------ */
+/* --- DAI format helpers ------------------------------------------ */
 
 static const struct {
 	const char *name;
@@ -45,14 +49,11 @@ static unsigned int rp1_parse_dai_fmt(const char *str)
 {
 	int i;
 
-	if (!str)
-		return SND_SOC_DAIFMT_I2S;
-
-	for (i = 0; i < ARRAY_SIZE(rp1_dai_fmt_map); i++) {
-		if (!strcmp(str, rp1_dai_fmt_map[i].name))
-			return rp1_dai_fmt_map[i].fmt;
+	if (str) {
+		for (i = 0; i < ARRAY_SIZE(rp1_dai_fmt_map); i++)
+			if (!strcmp(str, rp1_dai_fmt_map[i].name))
+				return rp1_dai_fmt_map[i].fmt;
 	}
-
 	return SND_SOC_DAIFMT_I2S;
 }
 
@@ -61,23 +62,14 @@ static const char *rp1_dai_fmt_name(unsigned int fmt)
 	int i;
 
 	fmt &= SND_SOC_DAIFMT_FORMAT_MASK;
-
-	for (i = 0; i < ARRAY_SIZE(rp1_dai_fmt_map); i++) {
+	for (i = 0; i < ARRAY_SIZE(rp1_dai_fmt_map); i++)
 		if (rp1_dai_fmt_map[i].fmt == fmt)
 			return rp1_dai_fmt_map[i].name;
-	}
-
 	return "i2s";
 }
 
 /* --- DAI link callbacks ------------------------------------------ */
 
-/*
- * Set the DAI format and TDM slot configuration on each link.
- *
- * If the CPU DAI rejects master mode (hardware may be synthesized as
- * slave-only), fall back to slave mode automatically.
- */
 static int rp1_tdm_dai_init(struct snd_soc_pcm_runtime *rtd)
 {
 	struct rp1_audio_tdm_priv *priv = snd_soc_card_get_drvdata(rtd->card);
@@ -91,6 +83,10 @@ static int rp1_tdm_dai_init(struct snd_soc_pcm_runtime *rtd)
 
 	ret = snd_soc_dai_set_fmt(cpu_dai, fmt);
 	if (ret == -EINVAL && priv->is_master) {
+		/*
+		 * DWC I2S COMP1 MODE_EN=0: hardware is slave-only.
+		 * Transparently fall back instead of failing the card.
+		 */
 		dev_info(priv->dev, "%s: no master support, using slave mode\n",
 			 rtd->dai_link->name);
 		fmt &= ~SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK;
@@ -108,7 +104,6 @@ static int rp1_tdm_dai_init(struct snd_soc_pcm_runtime *rtd)
 				     "%s: codec DAI set_fmt failed\n",
 				     rtd->dai_link->name);
 
-	/* Configure TDM slots when using more than standard stereo */
 	if (priv->tdm_slots > 2) {
 		unsigned int mask = GENMASK(priv->tdm_slots - 1, 0);
 
@@ -117,7 +112,7 @@ static int rp1_tdm_dai_init(struct snd_soc_pcm_runtime *rtd)
 						priv->tdm_slot_width);
 		if (ret)
 			return dev_err_probe(priv->dev, ret,
-					     "%s: CPU DAI TDM slot config failed\n",
+					     "%s: TDM slot config failed\n",
 					     rtd->dai_link->name);
 
 		ret = snd_soc_dai_set_tdm_slot(codec_dai, mask, mask,
@@ -125,9 +120,35 @@ static int rp1_tdm_dai_init(struct snd_soc_pcm_runtime *rtd)
 						priv->tdm_slot_width);
 		if (ret && ret != -ENOTSUPP)
 			return dev_err_probe(priv->dev, ret,
-					     "%s: codec DAI TDM slot config failed\n",
+					     "%s: codec TDM slot config failed\n",
 					     rtd->dai_link->name);
 	}
+
+	return 0;
+}
+
+/*
+ * Apply low-latency PCM constraints at stream open time.
+ * This allows userspace (JACK, PipeWire) to request small periods
+ * without being rejected by overly conservative defaults.
+ */
+static int rp1_tdm_startup(struct snd_pcm_substream *substream)
+{
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	int ret;
+
+	/* Allow small period sizes for low-latency operation */
+	ret = snd_pcm_hw_constraint_minmax(runtime,
+					    SNDRV_PCM_HW_PARAM_PERIOD_BYTES,
+					    RP1_PERIOD_BYTES_MIN, UINT_MAX);
+	if (ret < 0)
+		return ret;
+
+	ret = snd_pcm_hw_constraint_minmax(runtime,
+					    SNDRV_PCM_HW_PARAM_PERIODS,
+					    RP1_PERIODS_MIN, UINT_MAX);
+	if (ret < 0)
+		return ret;
 
 	return 0;
 }
@@ -142,17 +163,6 @@ static int rp1_tdm_hw_params(struct snd_pcm_substream *substream,
 	unsigned int bclk_ratio;
 	int ret;
 
-	/*
-	 * BCLK = sample_rate * bclk_ratio
-	 *
-	 * Standard I2S : slot_width * 2       = 64  (at 32-bit)
-	 * TDM          : slot_width * n_slots = 256 (at 8 slots)
-	 *
-	 * In master mode with TDM >2 slots the upstream DWC I2S driver
-	 * rejects bclk_ratio values other than 32/48/64 due to the CCR
-	 * register switch. Apply patches/0001-* to lift that limit.
-	 * Slave mode is unaffected since the external codec drives BCLK.
-	 */
 	if (priv->tdm_slots > 2)
 		bclk_ratio = priv->tdm_slot_width * priv->tdm_slots;
 	else
@@ -163,7 +173,6 @@ static int rp1_tdm_hw_params(struct snd_pcm_substream *substream,
 		return dev_err_probe(priv->dev, ret,
 				     "BCLK ratio %u rejected\n", bclk_ratio);
 
-	/* Drive MCLK output if configured */
 	if (priv->mclk_clk && priv->mclk_fs) {
 		unsigned long mclk_rate = (unsigned long)rate * priv->mclk_fs;
 
@@ -180,9 +189,6 @@ static int rp1_tdm_hw_params(struct snd_pcm_substream *substream,
 						     "MCLK enable failed\n");
 			priv->mclk_enabled = true;
 		}
-
-		dev_dbg(priv->dev, "MCLK: %lu Hz (%u x %u)\n",
-			mclk_rate, rate, priv->mclk_fs);
 	}
 
 	return 0;
@@ -202,11 +208,12 @@ static int rp1_tdm_hw_free(struct snd_pcm_substream *substream)
 }
 
 static const struct snd_soc_ops rp1_tdm_ops = {
+	.startup   = rp1_tdm_startup,
 	.hw_params = rp1_tdm_hw_params,
 	.hw_free   = rp1_tdm_hw_free,
 };
 
-/* --- DAI link component definitions ------------------------------ */
+/* --- DAI link definitions ---------------------------------------- */
 
 SND_SOC_DAILINK_DEFS(link0,
 	DAILINK_COMP_ARRAY(COMP_EMPTY()),
@@ -218,7 +225,7 @@ SND_SOC_DAILINK_DEFS(link1,
 	DAILINK_COMP_ARRAY(COMP_CODEC("snd-soc-dummy", "snd-soc-dummy-dai")),
 	DAILINK_COMP_ARRAY(COMP_EMPTY()));
 
-/* --- Device tree parsing ----------------------------------------- */
+/* --- MCLK clock management -------------------------------------- */
 
 static int rp1_tdm_parse_mclk(struct rp1_audio_tdm_priv *priv,
 			       struct device_node *np)
@@ -255,6 +262,8 @@ static void rp1_tdm_release_mclk(void *data)
 	priv->mclk_clk = NULL;
 }
 
+/* --- Device tree parsing ----------------------------------------- */
+
 static int rp1_tdm_parse_dt(struct rp1_audio_tdm_priv *priv)
 {
 	struct device_node *np = priv->dev->of_node;
@@ -262,34 +271,28 @@ static int rp1_tdm_parse_dt(struct rp1_audio_tdm_priv *priv)
 	u32 val;
 	int ret;
 
-	/* DAI format: default I2S */
 	ret = of_property_read_string(np, "dai-format", &str);
 	priv->dai_fmt = rp1_parse_dai_fmt(ret ? NULL : str);
 
-	/* Clock role: default master */
 	ret = of_property_read_string(np, "clock-role", &str);
 	priv->is_master = ret || strcmp(str, "slave");
 
-	/* TDM slots: 2 = standard stereo I2S */
 	if (of_property_read_u32(np, "tdm-slots", &val))
 		val = 2;
 	if (val > RP1_TDM_MAX_SLOTS)
 		return dev_err_probe(priv->dev, -EINVAL,
-				     "tdm-slots %u exceeds maximum %u\n",
+				     "tdm-slots %u exceeds max %u\n",
 				     val, RP1_TDM_MAX_SLOTS);
 	priv->tdm_slots = val;
 
-	/* Slot width: DWC I2S only supports 32-bit */
 	if (of_property_read_u32(np, "tdm-slot-width", &val))
 		val = RP1_TDM_SLOT_WIDTH;
-	if (val != RP1_TDM_SLOT_WIDTH) {
+	if (val != RP1_TDM_SLOT_WIDTH)
 		dev_warn(priv->dev,
 			 "DWC I2S requires 32-bit slot width, ignoring %u\n",
 			 val);
-	}
 	priv->tdm_slot_width = RP1_TDM_SLOT_WIDTH;
 
-	/* MCLK: optional */
 	if (of_property_read_u32(np, "mclk-fs", &val))
 		val = 0;
 	priv->mclk_fs = val;
@@ -298,7 +301,7 @@ static int rp1_tdm_parse_dt(struct rp1_audio_tdm_priv *priv)
 		ret = rp1_tdm_parse_mclk(priv, np);
 		if (ret) {
 			dev_info(priv->dev,
-				 "MCLK clock not available, disabling (mclk-fs was %u)\n",
+				 "MCLK clock unavailable, disabling (mclk-fs=%u)\n",
 				 priv->mclk_fs);
 			priv->mclk_fs = 0;
 		} else {
@@ -324,78 +327,77 @@ static int rp1_tdm_parse_dt(struct rp1_audio_tdm_priv *priv)
 
 /* --- DAI link construction --------------------------------------- */
 
-/*
- * Component arrays for each possible link. These are statically
- * allocated because SND_SOC_DAILINK_DEFS expands to file-scope
- * arrays that the DAI link references by pointer.
- */
 static const struct {
 	const char *name;
-	const char *stream;
+	const char *dt_prop;
 	struct snd_soc_dai_link_component *cpus;
 	int num_cpus;
 	struct snd_soc_dai_link_component *codecs;
 	int num_codecs;
 	struct snd_soc_dai_link_component *platforms;
 	int num_platforms;
-} rp1_link_templates[] = {
+} rp1_link_defs[] = {
 	{
-		.name      = "rp1-i2s0",
-		.stream    = "rp1-i2s0",
-		.cpus      = link0_cpus,
-		.num_cpus  = ARRAY_SIZE(link0_cpus),
-		.codecs    = link0_codecs,
+		.name       = "rp1-i2s0",
+		.dt_prop    = "i2s-controller-0",
+		.cpus       = link0_cpus,
+		.num_cpus   = ARRAY_SIZE(link0_cpus),
+		.codecs     = link0_codecs,
 		.num_codecs = ARRAY_SIZE(link0_codecs),
-		.platforms = link0_platforms,
+		.platforms  = link0_platforms,
 		.num_platforms = ARRAY_SIZE(link0_platforms),
 	},
 	{
-		.name      = "rp1-i2s2",
-		.stream    = "rp1-i2s2",
-		.cpus      = link1_cpus,
-		.num_cpus  = ARRAY_SIZE(link1_cpus),
-		.codecs    = link1_codecs,
+		.name       = "rp1-i2s2",
+		.dt_prop    = "i2s-controller-1",
+		.cpus       = link1_cpus,
+		.num_cpus   = ARRAY_SIZE(link1_cpus),
+		.codecs     = link1_codecs,
 		.num_codecs = ARRAY_SIZE(link1_codecs),
-		.platforms = link1_platforms,
+		.platforms  = link1_platforms,
 		.num_platforms = ARRAY_SIZE(link1_platforms),
 	},
 };
 
-static int rp1_tdm_setup_links(struct rp1_audio_tdm_priv *priv)
+static void rp1_tdm_release_of_nodes(void *data)
 {
-	static const char * const dt_props[] = {
-		"i2s-controller-0",
-		"i2s-controller-1",
-	};
-	struct device_node *np = priv->dev->of_node;
-	unsigned int n = 0;
+	struct rp1_audio_tdm_priv *priv = data;
 	int i;
 
 	for (i = 0; i < RP1_TDM_MAX_CONTROLLERS; i++) {
+		of_node_put(priv->i2s_nodes[i]);
+		priv->i2s_nodes[i] = NULL;
+	}
+}
+
+static int rp1_tdm_setup_links(struct rp1_audio_tdm_priv *priv)
+{
+	struct device_node *np = priv->dev->of_node;
+	unsigned int n = 0;
+	int i, ret;
+
+	for (i = 0; i < ARRAY_SIZE(rp1_link_defs); i++) {
 		struct device_node *i2s_np;
 		struct snd_soc_dai_link *link;
 
-		i2s_np = of_parse_phandle(np, dt_props[i], 0);
+		i2s_np = of_parse_phandle(np, rp1_link_defs[i].dt_prop, 0);
 		if (!i2s_np)
 			continue;
 
-		link = &priv->dai_links[n];
-		link->name        = rp1_link_templates[i].name;
-		link->stream_name = rp1_link_templates[i].stream;
-		link->cpus        = rp1_link_templates[i].cpus;
-		link->num_cpus    = rp1_link_templates[i].num_cpus;
-		link->codecs      = rp1_link_templates[i].codecs;
-		link->num_codecs  = rp1_link_templates[i].num_codecs;
-		link->platforms   = rp1_link_templates[i].platforms;
-		link->num_platforms = rp1_link_templates[i].num_platforms;
-		link->init        = rp1_tdm_dai_init;
-		link->ops         = &rp1_tdm_ops;
+		priv->i2s_nodes[i] = i2s_np;
 
-		/*
-		 * Point the CPU and platform components at the I2S
-		 * controller from the device tree. The of_node reference
-		 * is held for the lifetime of the card.
-		 */
+		link = &priv->dai_links[n];
+		link->name          = rp1_link_defs[i].name;
+		link->stream_name   = rp1_link_defs[i].name;
+		link->cpus          = rp1_link_defs[i].cpus;
+		link->num_cpus      = rp1_link_defs[i].num_cpus;
+		link->codecs        = rp1_link_defs[i].codecs;
+		link->num_codecs    = rp1_link_defs[i].num_codecs;
+		link->platforms     = rp1_link_defs[i].platforms;
+		link->num_platforms = rp1_link_defs[i].num_platforms;
+		link->init          = rp1_tdm_dai_init;
+		link->ops           = &rp1_tdm_ops;
+
 		link->cpus->of_node      = i2s_np;
 		link->platforms->of_node = i2s_np;
 
@@ -404,13 +406,19 @@ static int rp1_tdm_setup_links(struct rp1_audio_tdm_priv *priv)
 
 	if (!n)
 		return dev_err_probe(priv->dev, -EINVAL,
-				     "no I2S controllers found in device tree\n");
+				     "no I2S controllers in device tree\n");
+
+	/* Ensure of_node references are released on driver unbind */
+	ret = devm_add_action_or_reset(priv->dev, rp1_tdm_release_of_nodes,
+				       priv);
+	if (ret)
+		return ret;
 
 	priv->num_links = n;
 	return 0;
 }
 
-/* --- Platform driver ---------------------------------------------- */
+/* --- Platform driver --------------------------------------------- */
 
 static int rp1_audio_tdm_probe(struct platform_device *pdev)
 {
@@ -440,7 +448,8 @@ static int rp1_audio_tdm_probe(struct platform_device *pdev)
 
 	ret = devm_snd_soc_register_card(&pdev->dev, &priv->card);
 	if (ret)
-		return dev_err_probe(&pdev->dev, ret, "card registration failed\n");
+		return dev_err_probe(&pdev->dev, ret,
+				     "card registration failed\n");
 
 	dev_info(&pdev->dev, "%u link(s) active [%s %s]\n",
 		 priv->num_links, GIT_BRANCH, GIT_HASH);
