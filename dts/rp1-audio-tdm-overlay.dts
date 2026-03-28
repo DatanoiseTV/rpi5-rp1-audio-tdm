@@ -42,17 +42,21 @@
 	};
 
 	/* ----------------------------------------------------------
-	 * Fragment 1: GPIO pinctrl for i2s2 on GPIO42-47 (6 pins)
-	 *   GPIO42 = BCLK, GPIO43 = LRCLK
-	 *   GPIO44-47 = SD0-SD3 (up to 2 TX + 2 RX data lines)
+	 * Fragment 1: GPIO pinctrl for i2s2 on GPIO28-33 (6 pins)
+	 *   GPIO28 = BCLK, GPIO29 = LRCLK
+	 *   GPIO30-33 = SD0-SD3 (up to 2 TX + 2 RX data lines)
+	 *
+	 *   Note: GPIO42-47 alt set conflicts with USB VBUS.
+	 *   GPIO28-33 conflicts with SD1 -- only use when SD1
+	 *   is not needed.
 	 * ---------------------------------------------------------- */
 	fragment@1 {
 		target = <&gpio>;
 		__overlay__ {
 			rp1_i2s2_tdm: rp1_i2s2_tdm {
 				function = "i2s2";
-				pins = "gpio42", "gpio43", "gpio44",
-				       "gpio45", "gpio46", "gpio47";
+				pins = "gpio28", "gpio29", "gpio30",
+				       "gpio31", "gpio32", "gpio33";
 				bias-disable;
 				slew-rate = <0>;
 			};
