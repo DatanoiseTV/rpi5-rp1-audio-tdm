@@ -13,7 +13,7 @@
 #include <sound/soc.h>
 
 #define RP1_TDM_DRV_NAME         "rp1-audio-tdm"
-#define RP1_TDM_MAX_CONTROLLERS  2
+#define RP1_TDM_MAX_LINKS        3  /* i2s0 + i2s2 + pio-i2s */
 #define RP1_TDM_MAX_SLOTS        16
 #define RP1_TDM_SLOT_WIDTH       32   /* DWC I2S hardware constraint */
 
@@ -32,8 +32,8 @@ struct rp1_audio_tdm_priv {
 	struct snd_soc_card card;
 	struct device *dev;
 
-	struct snd_soc_dai_link dai_links[RP1_TDM_MAX_CONTROLLERS];
-	struct device_node *i2s_nodes[RP1_TDM_MAX_CONTROLLERS];
+	struct snd_soc_dai_link dai_links[RP1_TDM_MAX_LINKS];
+	struct device_node *link_nodes[RP1_TDM_MAX_LINKS];
 	unsigned int num_links;
 
 	unsigned int dai_fmt;

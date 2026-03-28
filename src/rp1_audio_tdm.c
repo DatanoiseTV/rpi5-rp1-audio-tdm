@@ -225,6 +225,12 @@ SND_SOC_DAILINK_DEFS(link1,
 	DAILINK_COMP_ARRAY(COMP_CODEC("snd-soc-dummy", "snd-soc-dummy-dai")),
 	DAILINK_COMP_ARRAY(COMP_EMPTY()));
 
+/* PIO I2S expansion (GPIO24-27, 8ch additional) */
+SND_SOC_DAILINK_DEFS(link_pio,
+	DAILINK_COMP_ARRAY(COMP_EMPTY()),
+	DAILINK_COMP_ARRAY(COMP_CODEC("snd-soc-dummy", "snd-soc-dummy-dai")),
+	DAILINK_COMP_ARRAY(COMP_EMPTY()));
+
 /* --- MCLK clock management -------------------------------------- */
 
 static int rp1_tdm_parse_mclk(struct rp1_audio_tdm_priv *priv,
@@ -327,16 +333,20 @@ static int rp1_tdm_parse_dt(struct rp1_audio_tdm_priv *priv)
 
 /* --- DAI link construction --------------------------------------- */
 
-static const struct {
+struct rp1_link_def {
 	const char *name;
 	const char *dt_prop;
+	const char *dai_name;  /* NULL = auto-detect from DT */
 	struct snd_soc_dai_link_component *cpus;
 	int num_cpus;
 	struct snd_soc_dai_link_component *codecs;
 	int num_codecs;
 	struct snd_soc_dai_link_component *platforms;
 	int num_platforms;
-} rp1_link_defs[] = {
+	bool use_init;         /* whether to call rp1_tdm_dai_init */
+};
+
+static const struct rp1_link_def rp1_link_defs[] = {
 	{
 		.name       = "rp1-i2s0",
 		.dt_prop    = "i2s-controller-0",
@@ -346,6 +356,7 @@ static const struct {
 		.num_codecs = ARRAY_SIZE(link0_codecs),
 		.platforms  = link0_platforms,
 		.num_platforms = ARRAY_SIZE(link0_platforms),
+		.use_init   = true,
 	},
 	{
 		.name       = "rp1-i2s2",
@@ -356,6 +367,19 @@ static const struct {
 		.num_codecs = ARRAY_SIZE(link1_codecs),
 		.platforms  = link1_platforms,
 		.num_platforms = ARRAY_SIZE(link1_platforms),
+		.use_init   = true,
+	},
+	{
+		.name       = "rp1-pio-i2s",
+		.dt_prop    = "pio-i2s",
+		.dai_name   = "rp1-pio-i2s-dai",
+		.cpus       = link_pio_cpus,
+		.num_cpus   = ARRAY_SIZE(link_pio_cpus),
+		.codecs     = link_pio_codecs,
+		.num_codecs = ARRAY_SIZE(link_pio_codecs),
+		.platforms  = link_pio_platforms,
+		.num_platforms = ARRAY_SIZE(link_pio_platforms),
+		.use_init   = false, /* PIO has its own PCM ops */
 	},
 };
 
@@ -364,7 +388,7 @@ static void rp1_tdm_release_of_nodes(void *data)
 	struct rp1_audio_tdm_priv *priv = data;
 	int i;
 
-	for (i = 0; i < RP1_TDM_MAX_CONTROLLERS; i++) {
+	for (i = 0; i < RP1_TDM_MAX_LINKS; i++) {
 		of_node_put(priv->i2s_nodes[i]);
 		priv->i2s_nodes[i] = NULL;
 	}
@@ -395,10 +419,13 @@ static int rp1_tdm_setup_links(struct rp1_audio_tdm_priv *priv)
 		link->num_codecs    = rp1_link_defs[i].num_codecs;
 		link->platforms     = rp1_link_defs[i].platforms;
 		link->num_platforms = rp1_link_defs[i].num_platforms;
-		link->init          = rp1_tdm_dai_init;
-		link->ops           = &rp1_tdm_ops;
+		if (rp1_link_defs[i].use_init) {
+			link->init = rp1_tdm_dai_init;
+			link->ops  = &rp1_tdm_ops;
+		}
 
 		link->cpus->of_node      = i2s_np;
+		link->cpus->dai_name     = rp1_link_defs[i].dai_name;
 		link->platforms->of_node = i2s_np;
 
 		n++;
