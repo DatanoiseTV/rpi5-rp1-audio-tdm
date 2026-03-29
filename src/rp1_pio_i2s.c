@@ -539,15 +539,26 @@ static void rp1_pio_i2s_remove(struct platform_device *pdev)
 	}
 
 	pio_sm_set_enabled(piod->pio, sm_mask, false);
-	flush_workqueue(piod->wq);
-	destroy_workqueue(piod->wq);
 
-	if (piod->capture_loaded)
+	if (piod->wq) {
+		flush_workqueue(piod->wq);
+		destroy_workqueue(piod->wq);
+	}
+
+	/*
+	 * Only remove programs that were actually loaded.
+	 * pio_remove_program WARNs if the offset is invalid.
+	 */
+	if (piod->capture_loaded) {
 		pio_remove_program(piod->pio, &capture_program,
 				   piod->capture_offset);
-	if (piod->playback_loaded)
+		piod->capture_loaded = false;
+	}
+	if (piod->playback_loaded) {
 		pio_remove_program(piod->pio, &playback_program,
 				   piod->playback_offset);
+		piod->playback_loaded = false;
+	}
 
 	pio_close(piod->pio);
 }
