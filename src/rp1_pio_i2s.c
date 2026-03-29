@@ -303,23 +303,58 @@ static int pio_i2s_pcm_prepare(struct snd_soc_component *component,
 				struct snd_pcm_substream *substream)
 {
 	struct pio_i2s_dev *piod = snd_soc_component_get_drvdata(component);
-	int i;
+	uint16_t sm_mask = 0;
+	int i, ret;
 
-	/* Store the ALSA DMA buffer address for each SM */
+	/* Stop any previously running SMs */
+	for (i = 0; i < piod->num_sms; i++) {
+		piod->sms[i].running = false;
+		sm_mask |= BIT(piod->sms[i].sm_index);
+	}
+	pio_sm_set_enabled(piod->pio, sm_mask, false);
+	flush_workqueue(piod->wq);
+
 	for (i = 0; i < piod->num_sms; i++) {
 		struct pio_i2s_sm_state *sm = &piod->sms[i];
 
-		/*
-		 * For 2ch (1 SM): the full ALSA buffer is ours.
-		 * For >2ch: each SM gets a contiguous slice.
-		 * TODO: proper interleaving for multi-SM.
-		 */
 		sm->dma_area = (unsigned char *)substream->runtime->dma_area +
 			       (i * sm->buf_bytes);
 		sm->hw_ptr = 0;
 		sm->dma_started = false;
+		sm->running = true;
 
 		pio_sm_clear_fifos(piod->pio, sm->sm_index);
+	}
+
+	/*
+	 * Sync all SMs to the I2S frame boundary via LRCLK, then
+	 * enable them. This runs in process context (prepare can sleep).
+	 */
+	for (i = 0; i < piod->num_sms; i++) {
+		pio_sm_exec(piod->pio, piod->sms[i].sm_index,
+			    PIO_WAIT_LRCLK_HI);
+		pio_sm_exec(piod->pio, piod->sms[i].sm_index,
+			    PIO_WAIT_LRCLK_LO);
+	}
+	pio_sm_set_enabled(piod->pio, sm_mask, true);
+
+	/* Kick off first DMA transfer on each SM */
+	for (i = 0; i < piod->num_sms; i++) {
+		struct pio_i2s_sm_state *sm = &piod->sms[i];
+		int pio_dir = (sm->dir == PIO_I2S_DIR_CAPTURE) ?
+			      PIO_DIR_FROM_SM : PIO_DIR_TO_SM;
+
+		ret = pio_sm_xfer_data(piod->pio, sm->sm_index, pio_dir,
+				       sm->period_bytes,
+				       sm->dma_area + sm->hw_ptr, 0,
+				       pio_i2s_dma_callback, sm);
+		if (ret) {
+			dev_err(piod->dev,
+				"PIO DMA xfer start failed SM%u: %d\n",
+				sm->sm_index, ret);
+			return ret;
+		}
+		sm->dma_started = true;
 	}
 
 	return 0;
@@ -334,19 +369,19 @@ static int pio_i2s_pcm_trigger(struct snd_soc_component *component,
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
-		for (i = 0; i < piod->num_sms; i++) {
+		/*
+		 * SMs and DMA are already running from prepare().
+		 * Just ensure the running flag is set so the callback
+		 * chain continues.
+		 */
+		for (i = 0; i < piod->num_sms; i++)
 			piod->sms[i].running = true;
-			piod->sms[i].dma_started = false;
-			/* Schedule work to start DMA + enable SMs */
-			queue_work(piod->wq, &piod->sms[i].dma_work);
-		}
 		break;
 
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
 		for (i = 0; i < piod->num_sms; i++)
 			piod->sms[i].running = false;
-		/* SMs will be disabled in hw_free or next prepare */
 		break;
 
 	default:
