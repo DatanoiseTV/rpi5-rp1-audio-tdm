@@ -327,15 +327,11 @@ static int pio_i2s_pcm_prepare(struct snd_soc_component *component,
 	}
 
 	/*
-	 * Sync all SMs to the I2S frame boundary via LRCLK, then
-	 * enable them. This runs in process context (prepare can sleep).
+	 * Enable all PIO SMs. They will self-synchronize to BCLK
+	 * via the WAIT instructions in the program. LRCLK frame
+	 * sync is skipped here because the hardware I2S may not
+	 * be running yet when this prepare is called.
 	 */
-	for (i = 0; i < piod->num_sms; i++) {
-		pio_sm_exec(piod->pio, piod->sms[i].sm_index,
-			    PIO_WAIT_LRCLK_HI);
-		pio_sm_exec(piod->pio, piod->sms[i].sm_index,
-			    PIO_WAIT_LRCLK_LO);
-	}
 	pio_sm_set_enabled(piod->pio, sm_mask, true);
 
 	/* Kick off first DMA transfer on each SM */
